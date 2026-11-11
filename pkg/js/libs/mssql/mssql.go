@@ -3,17 +3,63 @@ package mssql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"strings"
-	"time"
 
-	_ "github.com/microsoft/go-mssqldb"
-	"github.com/praetorian-inc/fingerprintx/pkg/plugins/services/mssql"
+	gomssql "github.com/microsoft/go-mssqldb"
 	"github.com/projectdiscovery/nuclei/v3/pkg/js/utils"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolstate"
 )
+
+// mssqlCustomDialer routes connection dialing through Nuclei's fastdialer.
+// Implementing HostDialer ensures the driver delegates hostname resolution to the dialer
+// rather than using the local OS net.LookupIP, keeping DNS resolution, scan proxies,
+// and dial-time network policies strictly enforced.
+type mssqlCustomDialer struct {
+	executionId string
+	host        string
+}
+
+var _ gomssql.HostDialer = (*mssqlCustomDialer)(nil)
+
+func (d *mssqlCustomDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialers := protocolstate.GetDialersWithId(d.executionId)
+	if dialers == nil {
+		return nil, fmt.Errorf("dialers not initialized for %s", d.executionId)
+	}
+	targetHost, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		targetHost = addr
+	}
+	if !protocolstate.IsHostAllowed(d.executionId, targetHost) {
+		return nil, protocolstate.ErrHostDenied.Msgf(targetHost)
+	}
+	return dialers.Fastdialer.Dial(ctx, network, addr)
+}
+
+func (d *mssqlCustomDialer) HostName() string {
+	return d.host
+}
+
+func openDB(executionId, target, username, password, dbName string) (*sql.DB, error) {
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		host = target
+	}
+	connString := mssqlConnString(target, username, password, dbName)
+	connector, err := gomssql.NewConnector(connString)
+	if err != nil {
+		return nil, err
+	}
+	connector.Dialer = &mssqlCustomDialer{
+		executionId: executionId,
+		host:        host,
+	}
+	return sql.OpenDB(connector), nil
+}
 
 type (
 	// Client is a client for MS SQL database.
@@ -68,13 +114,7 @@ func connect(ctx context.Context, executionId string, host string, port int, use
 
 	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
-	connString := fmt.Sprintf("sqlserver://%s:%s@%s?database=%s&connection+timeout=30",
-		url.PathEscape(username),
-		url.PathEscape(password),
-		target,
-		dbName)
-
-	db, err := sql.Open("sqlserver", connString)
+	db, err := openDB(executionId, target, username, password, dbName)
 	if err != nil {
 		return false, err
 	}
@@ -84,21 +124,48 @@ func connect(ctx context.Context, executionId string, host string, port int, use
 
 	_, err = db.ExecContext(ctx, "select 1")
 	if err != nil {
-		switch {
-		case strings.Contains(err.Error(), "connect: connection refused"):
-			fallthrough
-		case strings.Contains(err.Error(), "no pg_hba.conf entry for host"):
-			fallthrough
-		case strings.Contains(err.Error(), "network unreachable"):
-			fallthrough
-		case strings.Contains(err.Error(), "reset"):
-			fallthrough
-		case strings.Contains(err.Error(), "i/o timeout"):
+		if isNetworkError(err) {
 			return false, err
 		}
 		return false, nil
 	}
 	return true, nil
+}
+
+// isNetworkError reports whether an error indicates a network, dialer,
+// timeout, or policy failure as opposed to a server-side authentication rejection.
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	errStr := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"connection refused",
+		"actively refused",
+		"port closed",
+		"unable to open tcp connection",
+		"network unreachable",
+		"connection reset",
+		"i/o timeout",
+		"connection timed out",
+		"context canceled",
+		"deadline exceeded",
+		"dialers not initialized",
+		"network policy",
+		"host denied",
+	} {
+		if strings.Contains(errStr, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsMssql checks if the given host is running MS SQL database.
@@ -116,34 +183,21 @@ func (c *MSSQLClient) IsMssql(ctx context.Context, host string, port int) (bool,
 
 // @memo
 func isMssql(ctx context.Context, executionId string, host string, port int) (bool, error) {
-	if !protocolstate.IsHostAllowed(executionId, host) {
-		// host is not valid according to network policy
-		return false, protocolstate.ErrHostDenied.Msgf(host)
-	}
+	// Reuse the memoized fingerprint probe so IsMssql + FingerprintMssql share one dial.
+	_, err := memoizedfingerprintMssql(ctx, executionId, host, port)
+	return isMssqlResult(err)
+}
 
-	dialer := protocolstate.GetDialersWithId(executionId)
-	if dialer == nil {
-		return false, fmt.Errorf("dialers not initialized for %s", executionId)
-	}
-
-	conn, err := dialer.Fastdialer.Dial(ctx, "tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
+// isMssqlResult maps fingerprint probe errors to IsMssql's (ok, err) contract.
+func isMssqlResult(err error) (bool, error) {
 	if err != nil {
+		// Unparsable / non-MSSQL TDS replies are a negative detection, not a probe failure.
+		if errors.Is(err, errNotMssql) {
+			return false, nil
+		}
 		return false, err
 	}
-	defer func() {
-		_ = conn.Close()
-	}()
-
-	data, check, err := mssql.DetectMSSQL(conn, 5*time.Second)
-	if check && err != nil {
-		return false, nil
-	} else if !check && err != nil {
-		return false, err
-	}
-	if data.Version != "" {
-		return true, nil
-	}
-	return false, nil
+	return true, nil
 }
 
 // ExecuteQuery connects to MS SQL database using given credentials and executes a query.
@@ -165,8 +219,6 @@ func (c *MSSQLClient) ExecuteQuery(ctx context.Context, host string, port int, u
 		return nil, protocolstate.ErrHostDenied.Msgf(host)
 	}
 
-	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-
 	ok, err := c.IsMssql(ctx, host, port)
 	if err != nil {
 		return nil, err
@@ -175,13 +227,9 @@ func (c *MSSQLClient) ExecuteQuery(ctx context.Context, host string, port int, u
 		return nil, fmt.Errorf("not a mssql service")
 	}
 
-	connString := fmt.Sprintf("sqlserver://%s:%s@%s?database=%s&connection+timeout=30",
-		url.PathEscape(username),
-		url.PathEscape(password),
-		target,
-		dbName)
+	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
-	db, err := sql.Open("sqlserver", connString)
+	db, err := openDB(executionId, target, username, password, dbName)
 	if err != nil {
 		return nil, err
 	}
@@ -205,4 +253,12 @@ func (c *MSSQLClient) ExecuteQuery(ctx context.Context, host string, port int, u
 		return nil, err
 	}
 	return data, nil
+}
+
+func mssqlConnString(target, username, password, dbName string) string {
+	return fmt.Sprintf("sqlserver://%s:%s@%s?database=%s&connection+timeout=30",
+		url.PathEscape(username),
+		url.PathEscape(password),
+		target,
+		url.QueryEscape(dbName))
 }

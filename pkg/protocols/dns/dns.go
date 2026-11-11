@@ -1,7 +1,10 @@
 package dns
 
 import (
+	"context"
+	"net"
 	"strings"
+	"time"
 
 	"github.com/miekg/dns"
 	"github.com/pkg/errors"
@@ -10,10 +13,12 @@ import (
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/expressions"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/generators"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolstate"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/render"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/replacer"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/dns/dnsclientpool"
-	"github.com/projectdiscovery/retryabledns"
 	fileutil "github.com/projectdiscovery/utils/file"
+	iputil "github.com/projectdiscovery/utils/ip"
 )
 
 // Request contains a DNS protocol request to be made from a template
@@ -33,7 +38,7 @@ type Request struct {
 	Name string `yaml:"name,omitempty" json:"name,omitempty" jsonschema:"title=hostname to make dns request for,description=Name is the Hostname to make DNS request for"`
 	// description: |
 	//   RequestType is the type of DNS request to make.
-	RequestType DNSRequestTypeHolder `yaml:"type,omitempty" json:"type,omitempty" jsonschema:"title=type of dns request to make,description=Type is the type of DNS request to make,enum=A,enum=NS,enum=DS,enum=CNAME,enum=SOA,enum=PTR,enum=MX,enum=TXT,enum=AAAA"`
+	RequestType DNSRequestTypeHolder `yaml:"type,omitempty" json:"type,omitempty" jsonschema:"title=type of dns request to make,description=Type is the type of DNS request to make,enum=A,enum=NS,enum=DS,enum=CNAME,enum=SOA,enum=PTR,enum=MX,enum=TXT,enum=AAAA,enum=CAA,enum=TLSA,enum=ANY,enum=SRV,enum=RRSIG,enum=NSEC,enum=DNSKEY,enum=NSEC3,enum=NSEC3PARAM"`
 	// description: |
 	//   Class is the class of the DNS request.
 	//
@@ -84,7 +89,7 @@ type Request struct {
 	generator *generators.PayloadGenerator
 
 	CompiledOperators *operators.Operators `yaml:"-" json:"-"`
-	dnsClient         *retryabledns.Client
+	dnsClient         *dnsclientpool.Client
 	options           *protocols.ExecutorOptions
 
 	// cache any variables that may be needed for operation.
@@ -108,6 +113,7 @@ var RequestPartDefinitions = map[string]string{
 	"host":          "Host is the input to the template",
 	"matched":       "Matched is the input which was matched upon",
 	"request":       "Request contains the DNS request in text format",
+	"duration":      "Protocol operation duration in seconds",
 	"type":          "Type is the type of request made",
 	"rcode":         "Rcode field returned for the DNS request",
 	"question":      "Question contains the DNS question field",
@@ -155,6 +161,9 @@ func (request *Request) Compile(options *protocols.ExecutorOptions) error {
 		if err := compiled.Compile(); err != nil {
 			return errors.Wrap(err, "could not compile operators")
 		}
+		// llm operators only evaluate once they hold the scan's client; without
+		// it every llm path returns a negative result instead of an error.
+		protocols.BindLLMOperators(compiled, options)
 		request.CompiledOperators = compiled
 	}
 	request.class = classToInt(request.Class)
@@ -182,7 +191,65 @@ func (request *Request) Compile(options *protocols.ExecutorOptions) error {
 	return nil
 }
 
-func (request *Request) getDnsClient(options *protocols.ExecutorOptions, metadata map[string]interface{}) (*retryabledns.Client, error) {
+// resolverHost extracts the host/IP from a retryabledns resolver entry, which
+// may carry a transport prefix (e.g. "udp:", "tcp:") and an optional port.
+func resolverHost(resolver string) string {
+	r := strings.TrimSpace(resolver)
+	// strip URL-form prefixes before their shorter counterparts so that, e.g.,
+	// "udp://1.1.1.1:53" is not partially trimmed to "//1.1.1.1:53" by "udp:".
+	for _, prefix := range []string{"udp://", "tcp://", "tls://", "doh://", "udp:", "tcp:", "tls:", "doh:"} {
+		r = strings.TrimPrefix(r, prefix)
+	}
+	// strip a trailing :port if present (handles bare host or host:port).
+	if host, _, err := net.SplitHostPort(r); err == nil {
+		return host
+	}
+	return r
+}
+
+// pinResolverHost replaces a resolver host name with an address that the
+// network policy allows. The policy check passes when one address of the name
+// is allowed, and the dns client resolves the name again when it dials, so it
+// could otherwise reach a denied address of the same name.
+// The lookup stops after timeout, so a slow system resolver cannot hold the
+// request.
+func pinResolverHost(executionID, resolver, host string, timeout time.Duration) (string, error) {
+	// DoH and DoT resolvers dial through the scan dialer, which checks every
+	// address, and DoT verifies the certificate against the name.
+	if iputil.IsIP(host) || strings.HasPrefix(resolver, "doh:") || strings.HasPrefix(resolver, "dot:") {
+		return resolver, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+	if err != nil {
+		return "", errors.Wrapf(err, "could not resolve dns resolver %s", resolver)
+	}
+	prefix, address := resolver, ""
+	if index := strings.LastIndex(resolver, host); index != -1 {
+		prefix, address = resolver[:index], resolver[index:]
+	}
+	port := "53"
+	if _, p, err := net.SplitHostPort(address); err == nil && p != "" {
+		port = p
+	}
+	for _, addr := range addrs {
+		if protocolstate.IsHostAllowed(executionID, addr) {
+			return prefix + net.JoinHostPort(addr, port), nil
+		}
+	}
+	return "", errors.Errorf("dns resolver %s is blocked by network policy", resolver)
+}
+
+// resolverLookupTimeout is the scan timeout, or ten seconds when it is not set.
+func resolverLookupTimeout(options *protocols.ExecutorOptions) time.Duration {
+	if options.Options.Timeout > 0 {
+		return time.Duration(options.Options.Timeout) * time.Second
+	}
+	return 10 * time.Second
+}
+
+func (request *Request) getDnsClient(options *protocols.ExecutorOptions, metadata map[string]interface{}) (*dnsclientpool.Client, error) {
 	dnsClientOptions := &dnsclientpool.Configuration{
 		Retries: request.Retries,
 		Proxy:   options.Options.AliveSocksProxy,
@@ -204,11 +271,22 @@ func (request *Request) getDnsClient(options *protocols.ExecutorOptions, metadat
 					// Defer resolution to the per-request runtime path.
 					continue
 				}
-				evaluated, err := expressions.Evaluate(resolver, metadata)
+				result, err := render.Render(render.Input{Options: options.GetOptions(), Text: resolver, Values: metadata})
 				if err != nil {
 					return nil, errors.Wrap(err, "could not resolve resolvers expressions")
 				}
-				resolver = evaluated
+				resolver = result.Text
+			}
+			// validate template-specified resolvers against the network policy.
+			if host := resolverHost(resolver); host != "" {
+				if !protocolstate.IsHostAllowed(options.Options.ExecutionId, host) {
+					return nil, errors.Errorf("dns resolver %s is blocked by network policy", resolver)
+				}
+				pinned, err := pinResolverHost(options.Options.ExecutionId, resolver, host, resolverLookupTimeout(options))
+				if err != nil {
+					return nil, err
+				}
+				resolver = pinned
 			}
 			resolvers = append(resolvers, resolver)
 		}
@@ -284,6 +362,16 @@ func questionTypeToInt(questionType string) uint16 {
 		question = dns.TypeANY
 	case "SRV":
 		question = dns.TypeSRV
+	case "RRSIG":
+		question = dns.TypeRRSIG
+	case "NSEC":
+		question = dns.TypeNSEC
+	case "DNSKEY":
+		question = dns.TypeDNSKEY
+	case "NSEC3":
+		question = dns.TypeNSEC3
+	case "NSEC3PARAM":
+		question = dns.TypeNSEC3PARAM
 	}
 	return question
 }
@@ -312,5 +400,14 @@ func classToInt(class string) uint16 {
 
 // UpdateOptions replaces this request's options with a new copy
 func (r *Request) UpdateOptions(opts *protocols.ExecutorOptions) {
+	r.Operators = protocols.CloneOperators(r.Operators)
+	r.CompiledOperators = nil
+	if r.options == nil {
+		if opts != nil {
+			r.options = opts.Copy()
+		}
+		return
+	}
+	r.options = r.options.Copy()
 	r.options.ApplyNewEngineOptions(opts)
 }

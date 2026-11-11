@@ -3,11 +3,10 @@ package mssql
 
 import (
 	"context"
+
 	"errors"
 
 	"fmt"
-
-	_ "github.com/microsoft/go-mssqldb"
 
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolstate"
 )

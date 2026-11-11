@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Mzack9999/goja"
+	"github.com/projectdiscovery/goja"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/nuclei/v3/pkg/js/compiler"
 	"github.com/projectdiscovery/nuclei/v3/pkg/operators"
@@ -86,6 +86,17 @@ func (e *TemplateExecuter) Compile() error {
 		return nil
 	}
 	return e.engine.Compile()
+}
+
+// TemplateOptions returns the options of the template the requests belong
+// to, which name it.
+func (e *TemplateExecuter) TemplateOptions() *protocols.ExecutorOptions {
+	return e.options
+}
+
+// ProtocolRequests returns the compiled requests in execution order.
+func (e *TemplateExecuter) ProtocolRequests() []protocols.Request {
+	return e.requests
 }
 
 // Requests returns the total number of requests the rule will perform
@@ -283,6 +294,8 @@ func getErrorCause(err error) string {
 
 // ExecuteWithResults executes the protocol requests and returns results instead of writing them.
 func (e *TemplateExecuter) ExecuteWithResults(ctx *scan.ScanContext) ([]*output.ResultEvent, error) {
+	defer e.options.RemoveTemplateCtx(ctx.Input.MetaInput)
+
 	var errx error
 	if e.options.Flow != "" {
 		flowexec, err := flow.NewFlowExecutor(e.requests, ctx, e.options, e.results, e.program)
